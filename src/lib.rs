@@ -1,27 +1,10 @@
-extern crate hyper;
-extern crate rustc_serialize;
-extern crate url;
-extern crate mime;
-extern crate time;
-
-#[cfg(test)] #[macro_use] extern crate log;
-
-use hyper::header::{Header, HeaderFormat, ContentType};
-use hyper::client::{Client, IntoUrl};
-use hyper::net::HttpConnector;
-use hyper::header::parsing::from_one_raw_str;
-use hyper::error::Error as HttpError;
-use url::Url;
-use mime::Mime;
+use reqwest::Client;
 use rustc_serialize::{json, Decodable, Encodable, Decoder, Encoder};
-use rustc_serialize::json::{ToJson, Json};
+use std::convert::From;
 use std::error::Error;
-use std::convert::{From, Into};
-use std::io::Error as IoError;
 use std::io::Read;
-use std::collections::BTreeMap;
-use std::result::Result;
 use time::Timespec;
+use url::Url;
 
 pub trait JsonEncodable {
     fn json_encode(&self, e: &mut json::Encoder) -> Result<(), json::EncoderError>;
@@ -65,7 +48,8 @@ macro_rules! impl_item_pocket_action {
 
 #[derive(Debug)]
 pub enum PocketError {
-    Http(HttpError),
+    Http(reqwest::Error),
+    Io(std::io::Error),
     Json(json::DecoderError),
     Format(json::EncoderError),
     Proto(u16, String)
@@ -85,15 +69,15 @@ impl From<json::DecoderError> for PocketError {
     }
 }
 
-impl From<IoError> for PocketError {
-    fn from(err: IoError) -> PocketError {
-        PocketError::Http(From::from(err))
+impl From<reqwest::Error> for PocketError {
+    fn from(err: reqwest::Error) -> PocketError {
+        PocketError::Http(err)
     }
 }
 
-impl From<HttpError> for PocketError {
-    fn from(err: HttpError) -> PocketError {
-        PocketError::Http(err)
+impl From<std::io::Error> for PocketError {
+    fn from(err: std::io::Error) -> PocketError {
+        PocketError::Io(err)
     }
 }
 
@@ -101,6 +85,7 @@ impl Error for PocketError {
     fn description(&self) -> &str {
         match *self {
             PocketError::Http(ref e) => e.description(),
+            PocketError::Io(ref e) => e.description(),
             PocketError::Json(ref e) => e.description(),
             PocketError::Format(ref e) => e.description(),
             PocketError::Proto(..) => "protocol error"
@@ -110,6 +95,7 @@ impl Error for PocketError {
     fn cause(&self) -> Option<&Error> {
         match *self {
             PocketError::Http(ref e) => Some(e),
+            PocketError::Io(ref e) => Some(e),
             PocketError::Json(ref e) => Some(e),
             PocketError::Format(ref e) => Some(e),
             PocketError::Proto(..) => None
@@ -121,79 +107,11 @@ impl std::fmt::Display for PocketError {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
         match *self {
             PocketError::Http(ref e) => e.fmt(fmt),
+            PocketError::Io(ref e) => e.fmt(fmt),
             PocketError::Json(ref e) => e.fmt(fmt),
             PocketError::Format(ref e) => e.fmt(fmt),
             PocketError::Proto(ref code, ref msg) => fmt.write_str(&*format!("{} (code {})", msg, code))
         }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct XAccept(pub Mime);
-
-impl std::ops::Deref for XAccept {
-    type Target = Mime;
-    fn deref<'a>(&'a self) -> &'a Mime {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for XAccept {
-    fn deref_mut<'a>(&'a mut self) -> &'a mut Mime {
-        &mut self.0
-    }
-}
-
-impl Header for XAccept {
-    fn header_name() -> &'static str {
-        "X-Accept"
-    }
-
-    fn parse_header(raw: &[Vec<u8>]) -> Result<XAccept, HttpError> {
-        from_one_raw_str(raw).map(|mime| XAccept(mime))
-    }
-}
-
-impl HeaderFormat for XAccept {
-    fn fmt_header(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, fmt)
-    }
-}
-
-#[derive(Clone, Debug)]
-struct XError(String);
-#[derive(Clone, Debug)]
-struct XErrorCode(u16);
-
-impl Header for XError {
-    fn header_name() -> &'static str {
-        "X-Error"
-    }
-
-    fn parse_header(raw: &[Vec<u8>]) -> Result<XError, HttpError> {
-        from_one_raw_str(raw).map(|error| XError(error))
-    }
-}
-
-impl HeaderFormat for XError {
-    fn fmt_header(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, fmt)
-    }
-}
-
-impl Header for XErrorCode {
-    fn header_name() -> &'static str {
-        "X-Error-Code"
-    }
-
-    fn parse_header(raw: &[Vec<u8>]) -> Result<XErrorCode, HttpError> {
-        from_one_raw_str(raw).map(|code| XErrorCode(code))
-    }
-}
-
-impl HeaderFormat for XErrorCode {
-    fn fmt_header(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, fmt)
     }
 }
 
@@ -233,7 +151,7 @@ pub struct PocketAuthorizeResponse {
 pub struct PocketAddRequest<'a> {
     consumer_key: &'a str,
     access_token: &'a str,
-    url: &'a Url,
+    url: &'a str,
     title: Option<&'a str>,
     tags: Option<&'a str>,
     tweet_id: Option<&'a str>
@@ -244,7 +162,7 @@ pub struct PocketAddRequest<'a> {
 pub struct ItemImage {
     pub item_id: u64, // String
     pub image_id: u64, // String
-    pub src: Url,
+    pub src: String,
     pub width: u16, // String
     pub height: u16, // String
     pub caption: String,
@@ -255,7 +173,7 @@ pub struct ItemImage {
 pub struct ItemVideo {
     pub item_id: u64, // String
     pub video_id: u64, // String
-    pub src: Url,
+    pub src: String,
     pub width: u16, // String
     pub height: u16, // String
     pub length: Option<usize>, // String
@@ -266,14 +184,14 @@ pub struct ItemVideo {
 impl Decodable for ItemVideo {
     fn decode<D: Decoder>(d: &mut D) -> Result<ItemVideo, D::Error> {
         d.read_struct("ItemVideo", 0, |d| Ok(ItemVideo {
-            item_id: try!(d.read_struct_field("item_id", 0, |d| d.read_u64())),
-            video_id: try!(d.read_struct_field("video_id", 1, |d| d.read_u64())),
-            src: try!(d.read_struct_field("src", 2, Decodable::decode)),
-            width: try!(d.read_struct_field("width", 3, |d| d.read_u16())),
-            height: try!(d.read_struct_field("height", 4, |d| d.read_u16())),
-            length: try!(d.read_struct_field("length", 5, |d| d.read_option(|d, b| if b { d.read_usize().map(|v| Some(v)) } else { Ok(None) }))),
-            vid: try!(d.read_struct_field("vid", 6, |d| d.read_str())),
-            vtype: try!(d.read_struct_field("type", 7, |d| d.read_u16())),
+            item_id: d.read_struct_field("item_id", 0, |d| d.read_u64())?,
+            video_id: d.read_struct_field("video_id", 1, |d| d.read_u64())?,
+            src: d.read_struct_field("src", 2, Decodable::decode)?,
+            width: d.read_struct_field("width", 3, |d| d.read_u16())?,
+            height: d.read_struct_field("height", 4, |d| d.read_u16())?,
+            length: d.read_struct_field("length", 5, |d| d.read_option(|d, b| if b { d.read_usize().map(|v| Some(v)) } else { Ok(None) }))?,
+            vid: d.read_struct_field("vid", 6, |d| d.read_str())?,
+            vtype: d.read_struct_field("type", 7, |d| d.read_u16())?,
         }))
     }
 }
@@ -301,8 +219,8 @@ pub struct PocketAddedItem {
     pub item_id: u64, // String
     pub extended_item_id: u64, // String
 
-    pub given_url: Url,
-    pub normal_url: Url,
+    pub given_url: String,
+    pub normal_url: String,
     pub content_length: usize, // String
     pub word_count: usize, // String
     pub encoding: String,
@@ -315,8 +233,8 @@ pub struct PocketAddedItem {
     pub date_resolved: String, // must be Tm or Timespec
 
     pub resolved_id: u64, // String
-    pub resolved_url: Url,
-    pub resolved_normal_url: Url,
+    pub resolved_url: String,
+    pub resolved_normal_url: String,
 
     pub login_required: bool, // String
     pub response_code: u16,
@@ -340,45 +258,45 @@ pub struct PocketAddedItem {
 impl Decodable for PocketAddedItem {
     fn decode<D: Decoder>(d: &mut D) -> Result<PocketAddedItem, D::Error> {
         d.read_struct("PocketAddedItem", 28, |d| Ok(PocketAddedItem {
-            item_id: try!(d.read_struct_field("item_id", 0, |d| d.read_u64())),
-            extended_item_id: try!(d.read_struct_field("extended_item_id", 1, |d| d.read_u64())),
+            item_id: d.read_struct_field("item_id", 0, |d| d.read_u64())?,
+            extended_item_id: d.read_struct_field("extended_item_id", 1, |d| d.read_u64())?,
 
-            given_url: try!(d.read_struct_field("given_url", 2, Decodable::decode)),
-            normal_url: try!(d.read_struct_field("normal_url", 3, Decodable::decode)),
-            content_length: try!(d.read_struct_field("content_length", 4, |d| d.read_usize())),
-            word_count: try!(d.read_struct_field("word_count", 5, |d| d.read_usize())),
-            encoding: try!(d.read_struct_field("encoding", 6, |d| d.read_str())),
-            mime_type: try!(d.read_struct_field("mime_type", 7, |d| d.read_str())),
-            lang: try!(d.read_struct_field("lang", 8, |d| d.read_str())),
-            title: try!(d.read_struct_field("title", 9, |d| d.read_str())),
-            excerpt: try!(d.read_struct_field("excerpt", 10, |d| d.read_str())),
+            given_url: d.read_struct_field("given_url", 2, Decodable::decode)?,
+            normal_url: d.read_struct_field("normal_url", 3, Decodable::decode)?,
+            content_length: d.read_struct_field("content_length", 4, |d| d.read_usize())?,
+            word_count: d.read_struct_field("word_count", 5, |d| d.read_usize())?,
+            encoding: d.read_struct_field("encoding", 6, |d| d.read_str())?,
+            mime_type: d.read_struct_field("mime_type", 7, |d| d.read_str())?,
+            lang: d.read_struct_field("lang", 8, |d| d.read_str())?,
+            title: d.read_struct_field("title", 9, |d| d.read_str())?,
+            excerpt: d.read_struct_field("excerpt", 10, |d| d.read_str())?,
 
-            date_published: try!(d.read_struct_field("date_published", 11, |d| d.read_str())),
-            date_resolved: try!(d.read_struct_field("date_resolved", 12, |d| d.read_str())),
+            date_published: d.read_struct_field("date_published", 11, |d| d.read_str())?,
+            date_resolved: d.read_struct_field("date_resolved", 12, |d| d.read_str())?,
 
-            resolved_id: try!(d.read_struct_field("resolved_id", 13, |d| d.read_u64())),
-            resolved_url: try!(d.read_struct_field("resolved_url", 14, Decodable::decode)),
-            resolved_normal_url: try!(d.read_struct_field("resolved_normal_url", 15, Decodable::decode)),
+            resolved_id: d.read_struct_field("resolved_id", 13, |d| d.read_u64())?,
+            resolved_url: d.read_struct_field("resolved_url", 14, Decodable::decode)?,
+            resolved_normal_url: d.read_struct_field("resolved_normal_url", 15, Decodable::decode)?,
 
-            login_required: try!(d.read_struct_field("login_required", 16, |d| d.read_u8().map(|v| v != 0))),
-            response_code: try!(d.read_struct_field("response_code", 17, |d| d.read_u16())),
-            used_fallback: try!(d.read_struct_field("used_fallback", 18, |d| d.read_u8().map(|v| v != 0))),
+            login_required: d.read_struct_field("login_required", 16, |d| d.read_u8().map(|v| v != 0))?,
+            response_code: d.read_struct_field("response_code", 17, |d| d.read_u16())?,
+            used_fallback: d.read_struct_field("used_fallback", 18, |d| d.read_u8().map(|v| v != 0))?,
 
-            domain_id: try!(d.read_struct_field("domain_id", 19, |d| d.read_u64())),
-            origin_domain_id: try!(d.read_struct_field("origin_domain_id", 20, |d| d.read_u64())),
-            innerdomain_redirect: try!(d.read_struct_field("innerdomain_redirect", 21, |d| d.read_u8().map(|v| v != 0))),
+            domain_id: d.read_struct_field("domain_id", 19, |d| d.read_u64())?,
+            origin_domain_id: d.read_struct_field("origin_domain_id", 20, |d| d.read_u64())?,
+            innerdomain_redirect: d.read_struct_field("innerdomain_redirect", 21, |d| d.read_u8().map(|v| v != 0))?,
 
-            is_index: try!(d.read_struct_field("is_index", 22, |d| d.read_u8().map(|v| v != 0))),
-            is_article: try!(d.read_struct_field("is_article", 23, |d| d.read_u8().map(|v| v != 0))),
-            has_image: try!(d.read_struct_field("has_image", 24, Decodable::decode)),
-            has_video: try!(d.read_struct_field("has_video", 25, Decodable::decode)),
+            is_index: d.read_struct_field("is_index", 22, |d| d.read_u8().map(|v| v != 0))?,
+            is_article: d.read_struct_field("is_article", 23, |d| d.read_u8().map(|v| v != 0))?,
+            has_image: d.read_struct_field("has_image", 24, Decodable::decode)?,
+            has_video: d.read_struct_field("has_video", 25, Decodable::decode)?,
 
-            videos: try!(d.read_struct_field("videos", 26, |d| d.read_seq(|d, s|
+            videos: d.read_struct_field("videos", 26, |d| d.read_seq(|d, s|
                 Ok((0..s).flat_map(|i| d.read_seq_elt(i, Decodable::decode)).into_iter().collect())
-            ))),
-            images: try!(d.read_struct_field("images", 27, |d| d.read_seq(|d, s|
+            ))?,
+            images: d.read_struct_field("images", 27, |d| d.read_seq(|d, s|
                 Ok((0..s).flat_map(|i| d.read_seq_elt(i, Decodable::decode)).into_iter().collect())
-            )))
+            ))?
         }))
     }
 }
@@ -658,16 +576,16 @@ pub struct PocketGetResponse {
 impl Decodable for PocketGetResponse {
     fn decode<D: Decoder>(d: &mut D) -> Result<PocketGetResponse, D::Error> {
         d.read_struct("PocketGetResponse", 5, |d| Ok(PocketGetResponse {
-            list: try!(d.read_struct_field("list", 0, |d| d.read_map(|d, s|
+            list: d.read_struct_field("list", 0, |d| d.read_map(|d, s|
                 Ok((0..s).flat_map(|i|
                     d.read_map_elt_key(i, |d| d.read_str()).and_then(|_|
                     d.read_map_elt_val(i, Decodable::decode)).into_iter())
                 .collect())
-            ))),
-            status: try!(d.read_struct_field("status", 1, |d| d.read_u16())),
-            complete: try!(d.read_struct_field("complete", 2, |d| d.read_u8().map(|v| v != 0))),
-            error: try!(d.read_struct_field("error", 3, |d| d.read_option(|d, b| if b { d.read_str().map(Some) } else { Ok(None) }))),
-            since: try!(d.read_struct_field("since", 4, |d| d.read_u64().map(|v| Timespec::new(v as i64, 0))))
+            ))?,
+            status: d.read_struct_field("status", 1, |d| d.read_u16())?,
+            complete: d.read_struct_field("complete", 2, |d| d.read_u8().map(|v| v != 0))?,
+            error: d.read_struct_field("error", 3, |d| d.read_option(|d, b| if b { d.read_str().map(Some) } else { Ok(None) }))?,
+            since: d.read_struct_field("since", 4, |d| d.read_u64().map(|v| Timespec::new(v as i64, 0)))?
         }))
     }
 }
@@ -695,7 +613,7 @@ impl Decodable for PocketItemStatus {
 pub struct PocketItem {
     pub item_id: u64,
 
-    pub given_url: Url,
+    pub given_url: String,
     pub given_title: String,
 
     pub word_count: usize,
@@ -715,7 +633,7 @@ pub struct PocketItem {
 
     pub resolved_id: u64,
     pub resolved_title: String,
-    pub resolved_url: Url,
+    pub resolved_url: String,
 
     pub sort_id: usize,
 
@@ -727,42 +645,42 @@ pub struct PocketItem {
 impl Decodable for PocketItem {
     fn decode<D: Decoder>(d: &mut D) -> Result<PocketItem, D::Error> {
         d.read_struct("PocketItem", 21, |d| Ok(PocketItem {
-            item_id: try!(d.read_struct_field("item_id", 0, |d| d.read_u64())),
+            item_id: d.read_struct_field("item_id", 0, |d| d.read_u64())?,
 
-            given_url: try!(d.read_struct_field("given_url", 1, Decodable::decode)),
-            given_title: try!(d.read_struct_field("given_title", 2, |d| d.read_str())),
+            given_url: d.read_struct_field("given_url", 1, Decodable::decode)?,
+            given_title: d.read_struct_field("given_title", 2, |d| d.read_str())?,
 
-            word_count: try!(d.read_struct_field("word_count", 3, |d| d.read_usize())),
-            excerpt: try!(d.read_struct_field("excerpt", 4, |d| d.read_str())),
+            word_count: d.read_struct_field("word_count", 3, |d| d.read_usize())?,
+            excerpt: d.read_struct_field("excerpt", 4, |d| d.read_str())?,
 
-            time_added: try!(d.read_struct_field("time_added", 5, |d| d.read_u64().map(|v| Timespec::new(v as i64, 0)))),
-            time_read: try!(d.read_struct_field("time_read", 6, |d| d.read_u64().map(|v| Timespec::new(v as i64, 0)))),
-            time_updated: try!(d.read_struct_field("time_updated", 7, |d| d.read_u64().map(|v| Timespec::new(v as i64, 0)))),
-            time_favorited: try!(d.read_struct_field("time_favorited", 8, |d| d.read_u64().map(|v| Timespec::new(v as i64, 0)))),
+            time_added: d.read_struct_field("time_added", 5, |d| d.read_u64().map(|v| Timespec::new(v as i64, 0)))?,
+            time_read: d.read_struct_field("time_read", 6, |d| d.read_u64().map(|v| Timespec::new(v as i64, 0)))?,
+            time_updated: d.read_struct_field("time_updated", 7, |d| d.read_u64().map(|v| Timespec::new(v as i64, 0)))?,
+            time_favorited: d.read_struct_field("time_favorited", 8, |d| d.read_u64().map(|v| Timespec::new(v as i64, 0)))?,
 
-            favorite: try!(d.read_struct_field("favorite", 9, |d| d.read_u8().map(|v| v != 0))),
-            is_index: try!(d.read_struct_field("is_index", 10, |d| d.read_u8().map(|v| v != 0))),
-            is_article: try!(d.read_struct_field("is_article", 11, |d| d.read_u8().map(|v| v != 0))),
-            has_image: try!(d.read_struct_field("has_image", 12, Decodable::decode)),
-            has_video: try!(d.read_struct_field("has_video", 13, Decodable::decode)),
+            favorite: d.read_struct_field("favorite", 9, |d| d.read_u8().map(|v| v != 0))?,
+            is_index: d.read_struct_field("is_index", 10, |d| d.read_u8().map(|v| v != 0))?,
+            is_article: d.read_struct_field("is_article", 11, |d| d.read_u8().map(|v| v != 0))?,
+            has_image: d.read_struct_field("has_image", 12, Decodable::decode)?,
+            has_video: d.read_struct_field("has_video", 13, Decodable::decode)?,
 
-            resolved_id: try!(d.read_struct_field("resolved_id", 14, |d| d.read_u64())),
-            resolved_title: try!(d.read_struct_field("resolved_title", 15, |d| d.read_str())),
-            resolved_url: try!(d.read_struct_field("resolved_url", 16, Decodable::decode)),
+            resolved_id: d.read_struct_field("resolved_id", 14, |d| d.read_u64())?,
+            resolved_title: d.read_struct_field("resolved_title", 15, |d| d.read_str())?,
+            resolved_url: d.read_struct_field("resolved_url", 16, Decodable::decode)?,
 
-            sort_id: try!(d.read_struct_field("sort_id", 17, |d| d.read_usize())),
-            status: try!(d.read_struct_field("status", 18, Decodable::decode)),
+            sort_id: d.read_struct_field("sort_id", 17, |d| d.read_usize())?,
+            status: d.read_struct_field("status", 18, Decodable::decode)?,
 
-            videos: try!(d.read_struct_field("videos", 19, |d| d.read_option(|d, b| if b {
+            videos: d.read_struct_field("videos", 19, |d| d.read_option(|d, b| if b {
                 d.read_map(|d, s| Ok((0..s).flat_map(|i| d.read_map_elt_val(i, Decodable::decode).into_iter()).collect())).map(Some)
             } else {
                 Ok(None)
-            }))),
-            images: try!(d.read_struct_field("images", 20, |d| d.read_option(|d, b| if b {
+            }))?,
+            images: d.read_struct_field("images", 20, |d| d.read_option(|d, b| if b {
                 d.read_map(|d, s| Ok((0..s).flat_map(|i| d.read_map_elt_val(i, Decodable::decode).into_iter()).collect())).map(Some)
             } else {
                 Ok(None)
-            })))
+            }))?
         }))
     }
 }
@@ -773,7 +691,7 @@ pub struct PocketAddAction<'a> {
     tags: Option<&'a str>,
     time: Option<u64>,
     title: Option<&'a str>,
-    url: Option<&'a Url>
+    url: Option<&'a str>
 }
 
 impl<'a> PocketAction for PocketAddAction<'a> {
@@ -878,7 +796,7 @@ impl<'a, 'b> JsonEncodable for PocketSendRequest<'a, 'b> {
             e.emit_struct_field("access_token", 1, |e| self.pocket.access_token.as_ref().unwrap().encode(e))).and_then(|_|
             e.emit_struct_field("actions", 2, |e| e.emit_seq(self.actions.len(), |e| {
                 for (i, action) in self.actions.iter().enumerate() {
-                    try!(e.emit_seq_elt(i, |e| action.json_encode(e)));
+                    e.emit_seq_elt(i, |e| action.json_encode(e))?;
                 }
                 Ok(())
             })))
@@ -907,29 +825,35 @@ impl Pocket {
     }
 
     fn request<Resp: Decodable>(&mut self, url: &str, data: &str) -> PocketResult<Resp> {
-        let app_json: Mime = "application/json".parse().unwrap();
         self.client.post(url)
-            .header(XAccept(app_json.clone()))
-            .header(ContentType(app_json.clone()))
-            .body(data)
+            .header("XAccept", "application/json")
+            .header("ContentType", "application/json")
+            .body(data.to_string())
             .send().map_err(From::from)
-            .and_then(|mut r| match r.headers.get::<XErrorCode>().map(|v| v.0) {
+            .and_then(|mut r| match r.headers().get("XErrorCode") {
                 None => {
                     let mut out = String::new();
                     r.read_to_string(&mut out).map_err(From::from).map(|_| out)
                 },
-                Some(code) => Err(PocketError::Proto(code, r.headers.get::<XError>().map(|v| &*v.0)
-                                                     .unwrap_or("unknown protocol error").to_string())),
+                Some(code) => {
+                    let code = code.to_str().unwrap().parse().unwrap();
+                    let error = r.headers()
+                        .get("XError")
+                        .map(|v| v.to_str().unwrap())
+                        .unwrap_or("unknown protocol error")
+                        .to_string();
+                    Err(PocketError::Proto(code, error))
+                },
             })
             .and_then(|s| json::decode::<Resp>(&*s).map_err(From::from))
     }
 
     pub fn get_auth_url(&mut self) -> PocketResult<Url> {
-        let request = try!(json::encode(&PocketOAuthRequest {
+        let request = json::encode(&PocketOAuthRequest {
             consumer_key: &*self.consumer_key,
             redirect_uri: "rustapi:finishauth",
             state: None
-        }));
+        })?;
 
         self.request("https://getpocket.com/v3/oauth/request", &*request)
             .and_then(|r: PocketOAuthResponse| {
@@ -941,10 +865,10 @@ impl Pocket {
     }
 
     pub fn authorize(&mut self) -> PocketResult<String> {
-        let request = try!(json::encode(&PocketAuthorizeRequest {
+        let request = json::encode(&PocketAuthorizeRequest {
             consumer_key: &*self.consumer_key,
             code: self.code.as_ref().map(|v| &**v).unwrap()
-        }));
+        })?;
 
         match self.request("https://getpocket.com/v3/oauth/authorize", &*request)
         {
@@ -956,21 +880,21 @@ impl Pocket {
         }
     }
 
-    pub fn add<T: IntoUrl>(&mut self, url: T, title: Option<&str>, tags: Option<&str>, tweet_id: Option<&str>) -> PocketResult<PocketAddedItem> {
-        let request = try!(json::encode(&PocketAddRequest {
+    pub fn add(&mut self, url: &str, title: Option<&str>, tags: Option<&str>, tweet_id: Option<&str>) -> PocketResult<PocketAddedItem> {
+        let request = json::encode(&PocketAddRequest {
             consumer_key: &*self.consumer_key,
             access_token: &**self.access_token.as_ref().unwrap(),
-            url: &url.into_url().unwrap(),
+            url: url,
             title: title.map(|v| v.clone()),
             tags: tags.map(|v| v.clone()),
             tweet_id: tweet_id.map(|v| v.clone())
-        }));
+        })?;
 
         self.request("https://getpocket.com/v3/add", &*request)
             .map(|v: PocketAddResponse| v.item)
     }
 
-    #[inline] pub fn push<T: IntoUrl>(&mut self, url: T) -> PocketResult<PocketAddedItem> {
+    #[inline] pub fn push(&mut self, url: &str) -> PocketResult<PocketAddedItem> {
         self.add(url, None, None, None)
     }
 
